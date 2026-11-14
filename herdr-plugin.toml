@@ -1,0 +1,25 @@
+id = "herdsight.notify"
+name = "Herdsight Notify"
+version = "0.2.0"
+min_herdr_version = "0.9.5"
+description = "Send generic push notifications when a herdr agent needs input."
+platforms = ["macos"]
+
+[[startup]]
+command = ["python3", "hook.py", "startup"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "hook.py", "event"]
+
+[[panes]]
+id = "setup"
+title = "Herdsight setup"
+placement = "overlay"
+command = ["python3", "setup.py"]
+
+[[panes]]
+id = "uninstall"
+title = "Herdsight uninstall"
+placement = "overlay"
+command = ["python3", "setup.py", "uninstall"]
