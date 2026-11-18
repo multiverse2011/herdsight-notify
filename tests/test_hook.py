@@ -61,23 +61,28 @@ class FakeRelay:
     # Relay と同じ。drain が retry 予算の計算で読む。
     timeout = 8
 
-    def __init__(self, settings=None, handler=None, settings_status=200):
+    def __init__(
+        self, settings=None, handler=None, settings_status=200, service_info=None
+    ):
         self.settings = settings or ready_settings()
         self.handler = handler
         self.settings_status = settings_status
+        self.service_info = {"features": []} if service_info is None else service_info
         self.posts = []
         self.gets = []
 
     def url(self, path):
         return "https://relay.test" + path
 
-    def get(self, path):
+    def get(self, path, timeout=None):
         self.gets.append(path)
         if path == "/v1/source-settings":
             return self.settings_status, dict(self.settings)
+        if path == "/v1/service-info":
+            return 200, dict(self.service_info)
         return 200, {}
 
-    def post(self, path, body, idempotency_key=None):
+    def post(self, path, body, idempotency_key=None, timeout=None):
         call = {"path": path, "body": body, "key": idempotency_key}
         self.posts.append(call)
         if self.handler:
@@ -109,18 +114,35 @@ class HookTestCase(unittest.TestCase):
         self.host_dir = os.path.join(self.state_dir, HOST_ID)
         self.logs = []
         self.clock = [1000.0]
+        self.monotonic_clock = [1000.0]
 
-    def make_hook(self, relay, blocked=None, terminal=None, **host_overrides):
+    def make_hook(
+        self, relay, blocked=None, pane=None, content_key=None, fetch_content=None,
+        **host_overrides
+    ):
+        extra = {}
+        if content_key is not None:
+            extra["content_key"] = content_key
+        if fetch_content is not None:
+            extra["fetch_content"] = fetch_content
         return hook.Hook(
             host_config(**host_overrides),
             self.state_dir,
             relay,
-            blocked or (lambda: []),
-            terminal or (lambda pane_id: (True, "term-1")),
+            blocked or (lambda timeout: []),
+            pane or (lambda pane_id, timeout: (True, {"terminal_id": "term-1"})),
             now=lambda: self.clock[0],
             sleep=lambda seconds: None,
             log_line=self.logs.append,
+            monotonic=lambda: self.monotonic_clock[0],
+            **extra
         )
+
+    def with_features(self, hook_obj, features, version=None):
+        state = hook_obj.load()
+        state["features"] = list(features)
+        state["features_version"] = version or hook.PLUGIN_VERSION
+        hook_obj.save(state)
 
 
 class FingerprintTests(unittest.TestCase):
@@ -199,7 +221,7 @@ class StartupTests(HookTestCase):
             {"pane_id": "w9:p0", "workspace_id": "w9", "terminal_id": 42},
             {"pane_id": "w9:p1", "workspace_id": "w9", "terminal_id": "term-1"},
         ]
-        hook_obj = self.make_hook(relay, blocked=lambda: blocked)
+        hook_obj = self.make_hook(relay, blocked=lambda timeout: blocked)
 
         self.assertEqual(hook_obj.run_startup(), 0)
 
@@ -216,7 +238,7 @@ class StartupTests(HookTestCase):
             {"pane_id": "w9:p1", "workspace_id": "w9", "terminal_id": "term-1"},
             {"pane_id": "w9:p2", "workspace_id": "w9", "terminal_id": "term-2"},
         ]
-        hook_obj = self.make_hook(relay, blocked=lambda: blocked)
+        hook_obj = self.make_hook(relay, blocked=lambda timeout: blocked)
         self.assertEqual(hook_obj.run_startup(), 0)
 
         streams = [post for post in relay.posts if post["path"] == "/v1/streams"]
@@ -247,7 +269,7 @@ class StartupTests(HookTestCase):
             {"pane_id": "w10:p1", "workspace_id": "w10", "terminal_id": "t2"},
         ]
         hook_obj = self.make_hook(
-            relay, blocked=lambda: blocked, workspace_allowlist=["w9"]
+            relay, blocked=lambda timeout: blocked, workspace_allowlist=["w9"]
         )
         hook_obj.run_startup()
         baseline = relay.posts[0]["body"]["baseline"]
@@ -268,7 +290,7 @@ class StartupTests(HookTestCase):
 
     def test_startup_network_failure_does_not_suspend(self):
         relay = FakeRelay()
-        relay.get = lambda path: (None, None)  # Relay._send の OSError 相当
+        relay.get = lambda path, timeout=None: (None, None)  # Relay._send の OSError 相当
         hook_obj = self.make_hook(relay)
         self.assertEqual(hook_obj.run_startup(), 0)
         with open(os.path.join(self.host_dir, "state.json"), encoding="utf-8") as handle:
@@ -277,7 +299,7 @@ class StartupTests(HookTestCase):
         self.assertIsNone(state["settings_checked_at"])
 
     def test_agent_list_failure_sends_nothing(self):
-        def boom():
+        def boom(timeout):
             raise hook.HerdrError("no server")
 
         relay = FakeRelay()
@@ -297,7 +319,7 @@ class StartupTests(HookTestCase):
 
     def test_startup_discards_stale_blocked_pending_when_pane_is_idle(self):
         relay = FakeRelay()
-        hook_obj = self.make_hook(relay, blocked=lambda: [])
+        hook_obj = self.make_hook(relay, blocked=lambda timeout: [])
         state = hook_obj.load()
         hook_obj.enqueue(state, "w9:p1", "blocked", "generation-1", "fingerprint-1")
         state["panes"]["w9:p1"] = {
@@ -318,7 +340,7 @@ class StartupTests(HookTestCase):
     def test_startup_baselines_current_blocked_pane_without_sending_pending(self):
         relay = FakeRelay()
         current = {"pane_id": "w9:p1", "workspace_id": "w9", "terminal_id": "term-1"}
-        hook_obj = self.make_hook(relay, blocked=lambda: [current])
+        hook_obj = self.make_hook(relay, blocked=lambda timeout: [current])
         state = hook_obj.load()
         hook_obj.enqueue(state, "w9:p1", "blocked", "generation-1", "fingerprint-1")
         hook_obj.save(state)
@@ -391,13 +413,13 @@ class EventMappingTests(HookTestCase):
 
     def test_pane_get_failure_skips_event(self):
         relay = FakeRelay()
-        hook_obj = self.make_hook(relay, terminal=lambda pane_id: (False, None))
+        hook_obj = self.make_hook(relay, pane=lambda pane_id, timeout: (False, None))
         hook_obj.run_event(event_json())
         self.assertFalse(relay.posts)
 
     def test_missing_terminal_id_still_sends_null_fingerprint(self):
         relay = FakeRelay()
-        hook_obj = self.make_hook(relay, terminal=lambda pane_id: (True, None))
+        hook_obj = self.make_hook(relay, pane=lambda pane_id, timeout: (True, {}))
         hook_obj.run_event(event_json())
         events = relay.events()
         self.assertEqual(len(events), 1)
@@ -405,7 +427,9 @@ class EventMappingTests(HookTestCase):
 
     def test_non_string_terminal_id_still_sends_null_fingerprint(self):
         relay = FakeRelay()
-        hook_obj = self.make_hook(relay, terminal=lambda pane_id: (True, 123))
+        hook_obj = self.make_hook(
+            relay, pane=lambda pane_id, timeout: (True, {"terminal_id": 123})
+        )
 
         hook_obj.run_event(event_json())
 
@@ -416,7 +440,7 @@ class EventMappingTests(HookTestCase):
     def test_first_blocked_excludes_itself_from_baseline(self):
         relay = FakeRelay()
         other = {"pane_id": "w9:p9", "workspace_id": "w9", "terminal_id": "term-9"}
-        hook_obj = self.make_hook(relay, blocked=lambda: [other])
+        hook_obj = self.make_hook(relay, blocked=lambda timeout: [other])
         hook_obj.run_event(event_json(pane_id="w9:p1"))
         streams = [post for post in relay.posts if post["path"] == "/v1/streams"]
         self.assertEqual(len(streams), 1)
@@ -436,7 +460,7 @@ class EventMappingTests(HookTestCase):
     def test_suspended_recovery_excludes_current_pane_from_baseline(self):
         relay = FakeRelay()
         current = {"pane_id": "w9:p1", "workspace_id": "w9", "terminal_id": "term-1"}
-        hook_obj = self.make_hook(relay, blocked=lambda: [current])
+        hook_obj = self.make_hook(relay, blocked=lambda timeout: [current])
         state = hook_obj.load()
         state["suspended"] = True
         state["settings_checked_at"] = "1970-01-01T00:00:00.000Z"
@@ -455,7 +479,7 @@ class EventMappingTests(HookTestCase):
         state["suspended"] = True
         state["settings_checked_at"] = "1970-01-01T00:00:00.000Z"
         hook_obj.save(state)
-        relay.get = lambda path: (None, None)  # Relay._send の OSError 相当
+        relay.get = lambda path, timeout=None: (None, None)  # Relay._send の OSError 相当
 
         hook_obj.run_event(event_json())
 
@@ -467,7 +491,10 @@ class EventMappingTests(HookTestCase):
 
         # upload_state が ready でない枝は従来どおり: 停止のまま checked_at を更新する。
         self.clock[0] += 16 * 60
-        relay.get = lambda path: (200, dict(ready_settings(upload_state="no_links")))
+        relay.get = lambda path, timeout=None: (
+            200,
+            dict(ready_settings(upload_state="no_links")),
+        )
         hook_obj.run_event(event_json(status="idle"))
         state = hook_obj.load()
         self.assertTrue(state["suspended"])
@@ -487,7 +514,7 @@ class EventMappingTests(HookTestCase):
     def test_blocked_event_is_not_lost_when_pending_exists(self):
         relay = FakeRelay()
         current = {"pane_id": "w9:p1", "workspace_id": "w9", "terminal_id": "term-1"}
-        hook_obj = self.make_hook(relay, blocked=lambda: [current])
+        hook_obj = self.make_hook(relay, blocked=lambda timeout: [current])
         state = hook_obj.load()
         hook_obj.enqueue(state, "w9:p2", "blocked", "generation-2", None)
         hook_obj.save(state)
@@ -630,7 +657,7 @@ class PendingTests(HookTestCase):
 
         relay = FakeRelay(handler=handler)
         current = {"pane_id": "w9:p1", "workspace_id": "w9", "terminal_id": "term-1"}
-        hook_obj = self.make_hook(relay, blocked=lambda: [current])
+        hook_obj = self.make_hook(relay, blocked=lambda timeout: [current])
 
         hook_obj.run_event(event_json(pane_id="w9:p1"))
 
@@ -644,7 +671,7 @@ class PendingTests(HookTestCase):
 
     def test_expired_clear_rebuilds_baseline_before_next_block(self):
         relay = FakeRelay()
-        hook_obj = self.make_hook(relay, blocked=lambda: [])
+        hook_obj = self.make_hook(relay, blocked=lambda timeout: [])
         state = hook_obj.load()
         state["stream_id"] = "old-stream"
         state["stream_expires_at"] = "2099-01-01T00:00:00.000Z"
@@ -671,7 +698,7 @@ class PendingTests(HookTestCase):
             return None
 
         relay = FakeRelay(handler=handler)
-        hook_obj = self.make_hook(relay, blocked=lambda: [])
+        hook_obj = self.make_hook(relay, blocked=lambda timeout: [])
         state = hook_obj.load()
         state["suspended"] = True
         state["settings_checked_at"] = "1970-01-01T00:00:00.000Z"
@@ -694,7 +721,7 @@ class PendingTests(HookTestCase):
 
         hook_obj.run_event(event_json())
 
-        self.assertEqual(relay.gets, ["/v1/source-settings"])
+        self.assertEqual(relay.gets, ["/v1/service-info", "/v1/source-settings"])
         self.assertFalse(relay.posts)
         self.assertEqual(len(hook_obj.load()["pending"]), 1)
         self.assertTrue(any("credential rejected" in line for line in self.logs))
@@ -705,7 +732,7 @@ class PendingTests(HookTestCase):
 
         hook_obj.run_event(event_json())
 
-        self.assertEqual(relay.gets, ["/v1/source-settings"])
+        self.assertEqual(relay.gets, ["/v1/service-info", "/v1/source-settings"])
         self.assertEqual(len(hook_obj.load()["pending"]), 1)
 
     def test_upload_suspended_drops_pending_and_stops(self):
@@ -766,6 +793,887 @@ class PendingTests(HookTestCase):
         self.assertFalse(relay.events())
 
 
+CONTENT_KEY = bytes(range(32))
+CONTENT = {
+    "agent": "claude",
+    "workspace": "herdsight",
+    "tab": "main",
+    "title": "Fix the login flow",
+    "prompt": "テストを直してよいですか？",
+}
+
+
+class ContentSealTests(HookTestCase):
+    def test_blocked_event_is_sealed_only_when_the_relay_advertises_it(self):
+        relay = FakeRelay()
+        fetched = []
+
+        def fetch(pane_id, kind, remaining, pane):
+            fetched.append(pane_id)
+            return dict(CONTENT)
+
+        hook_obj = self.make_hook(
+            relay, content_key=CONTENT_KEY, fetch_content=fetch
+        )
+        hook_obj.run_event(event_json())
+        self.assertNotIn("sealed", relay.events()[0]["body"])
+        self.assertEqual(fetched, [])
+
+        self.with_features(hook_obj, ["sealed"])
+        hook_obj.run_event(event_json(pane_id="w9:p2"))
+
+        self.assertTrue(relay.events()[-1]["body"]["sealed"])
+        self.assertEqual(fetched, ["w9:p2"])
+        # 平文が stderr やログに出ない。
+        self.assertFalse(
+            any("claude" in line or "Fix the login flow" in line for line in self.logs)
+        )
+
+    def test_sealed_is_made_once_and_reused_on_retry(self):
+        attempts = {"events": 0}
+
+        def handler(call, _count):
+            if call["path"] == "/v1/events":
+                attempts["events"] += 1
+                if attempts["events"] == 1:
+                    return 429, {"error": {"retry_after_seconds": 0}}
+            return None
+
+        fetched = []
+        relay = FakeRelay(handler=handler)
+        hook_obj = self.make_hook(
+            relay,
+            content_key=CONTENT_KEY,
+            fetch_content=lambda pane_id, kind, remaining, pane: fetched.append(pane_id)
+            or dict(CONTENT),
+        )
+        self.with_features(hook_obj, ["sealed"])
+        hook_obj.run_event(event_json())
+
+        events = relay.events()
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0]["body"]["sealed"], events[1]["body"]["sealed"])
+        self.assertEqual(fetched, ["w9:p1"])
+
+    def test_all_null_content_still_gets_a_seal(self):
+        relay = FakeRelay()
+        hook_obj = self.make_hook(
+            relay,
+            content_key=CONTENT_KEY,
+            fetch_content=lambda pane_id, kind, remaining, pane: {
+                "agent": None,
+                "workspace": None,
+                "tab": None,
+                "title": None,
+                "prompt": None,
+            },
+        )
+        self.with_features(hook_obj, ["sealed"])
+        hook_obj.run_event(event_json())
+        self.assertTrue(relay.events()[0]["body"]["sealed"])
+
+    def test_a_fetch_exception_skips_the_seal_without_dropping_the_event(self):
+        def fetch(_pane_id, _kind, _remaining, _pane):
+            raise OSError("herdr is gone")
+
+        relay = FakeRelay()
+        hook_obj = self.make_hook(relay, content_key=CONTENT_KEY, fetch_content=fetch)
+        self.with_features(hook_obj, ["sealed"])
+        hook_obj.run_event(event_json())
+        self.assertEqual(len(relay.events()), 1)
+        self.assertNotIn("sealed", relay.events()[0]["body"])
+
+    def test_no_seal_without_the_content_key(self):
+        relay = FakeRelay()
+        fetched = []
+        hook_obj = self.make_hook(
+            relay, fetch_content=lambda pane_id, kind, remaining, pane: fetched.append(pane_id)
+            or dict(CONTENT)
+        )
+        self.with_features(hook_obj, ["sealed"])
+        hook_obj.run_event(event_json())
+        self.assertNotIn("sealed", relay.events()[0]["body"])
+        self.assertEqual(fetched, [])
+
+    def test_unresolved_terminal_has_no_seal(self):
+        relay = FakeRelay()
+        fetched = []
+        hook_obj = self.make_hook(
+            relay,
+            content_key=CONTENT_KEY,
+            fetch_content=lambda pane_id, kind, remaining, pane: fetched.append(pane_id)
+            or dict(CONTENT),
+        )
+        self.with_features(hook_obj, ["sealed"])
+        state = hook_obj.load()
+        hook_obj.map_event(state, "w9:p1", "blocked", resolve_terminal=False)
+        hook_obj.drain(state)
+        self.assertNotIn("sealed", relay.events()[0]["body"])
+        self.assertEqual(fetched, [])
+
+    def test_pending_finished_event_survives_a_reload(self):
+        relay = FakeRelay()
+        hook_obj = self.make_hook(relay)
+        state = hook_obj.load()
+        hook_obj.enqueue(state, "w9:p1", "finished", "generation-1", None, "sealed-1")
+        hook_obj.save(state)
+        reloaded = hook_obj.load()
+        self.assertEqual(reloaded["pending"][0]["state"], "finished")
+        self.assertEqual(reloaded["pending"][0]["sealed"], "sealed-1")
+
+
+class FinishedTests(HookTestCase):
+    def test_done_after_blocked_sends_clear_then_finished(self):
+        relay = FakeRelay()
+        hook_obj = self.make_hook(relay)
+        self.with_features(hook_obj, ["finished"])
+        hook_obj.run_event(event_json(status="blocked"))
+        hook_obj.run_event(event_json(status="done"))
+
+        self.assertEqual(
+            [event["body"]["state"] for event in relay.events()],
+            ["blocked", "clear", "finished"],
+        )
+        self.assertEqual(hook_obj.load()["panes"]["w9:p1"]["last_state"], "clear")
+
+    def test_done_for_an_unregistered_pane_sends_finished_only(self):
+        relay = FakeRelay()
+        hook_obj = self.make_hook(relay)
+        self.with_features(hook_obj, ["finished"])
+        hook_obj.run_event(event_json(status="done"))
+
+        self.assertEqual(
+            [event["body"]["state"] for event in relay.events()], ["finished"]
+        )
+        self.assertNotIn("w9:p1", hook_obj.load()["panes"])
+
+    def test_done_without_the_finished_feature_sends_nothing(self):
+        relay = FakeRelay()
+        hook_obj = self.make_hook(relay)
+        hook_obj.run_event(event_json(status="done"))
+        self.assertFalse(relay.posts)
+
+    def test_done_after_blocked_without_the_feature_sends_only_clear(self):
+        relay = FakeRelay()
+        hook_obj = self.make_hook(relay)
+        hook_obj.run_event(event_json(status="blocked"))
+        hook_obj.run_event(event_json(status="done"))
+        self.assertEqual(
+            [event["body"]["state"] for event in relay.events()],
+            ["blocked", "clear"],
+        )
+
+    def test_finished_is_sealed_with_the_finished_kind_and_a_null_prompt(self):
+        captured = {}
+
+        def fake_seal(key, kind, plaintext):
+            captured["kind"] = kind
+            captured["plaintext"] = plaintext
+            return "sealed"
+
+        relay = FakeRelay()
+        fetched = []
+        hook_obj = self.make_hook(
+            relay,
+            content_key=CONTENT_KEY,
+            fetch_content=lambda pane_id, kind, remaining, pane: fetched.append(pane_id)
+            or dict(CONTENT),
+        )
+        self.with_features(hook_obj, ["sealed", "finished"])
+        with unittest.mock.patch("hook.seal_content", side_effect=fake_seal):
+            hook_obj.run_event(event_json(status="done"))
+
+        self.assertEqual(captured["kind"], "finished")
+        self.assertIsNone(json.loads(captured["plaintext"])["prompt"])
+        self.assertTrue(relay.events()[0]["body"]["sealed"])
+        self.assertEqual(fetched, ["w9:p1"])
+
+
+class FeatureDegradeTests(HookTestCase):
+    def test_sealed_400_is_resent_without_sealed_and_without_a_new_stream(self):
+        bodies = []
+
+        def handler(call, _count):
+            if call["path"] == "/v1/events":
+                bodies.append(call)
+                if len(bodies) == 1:
+                    return 400, {"error": {"code": "invalid_request"}}
+            return None
+
+        relay = FakeRelay(handler=handler)
+        hook_obj = self.make_hook(relay, content_key=CONTENT_KEY,
+                                  fetch_content=lambda pane_id, kind, remaining, pane: dict(CONTENT))
+        self.with_features(hook_obj, ["sealed"])
+        hook_obj.run_event(event_json())
+
+        self.assertEqual(len(bodies), 2)
+        self.assertIn("sealed", bodies[0]["body"])
+        self.assertNotIn("sealed", bodies[1]["body"])
+        self.assertEqual(bodies[0]["body"]["event_id"], bodies[1]["body"]["event_id"])
+        self.assertEqual(bodies[0]["body"]["sequence"], bodies[1]["body"]["sequence"])
+        self.assertNotEqual(bodies[0]["key"], bodies[1]["key"])
+        self.assertEqual(
+            len([post for post in relay.posts if post["path"] == "/v1/streams"]), 1
+        )
+        self.assertEqual(hook_obj.load()["features"], [])
+        self.assertFalse(hook_obj.load()["pending"])
+
+    def test_finished_400_is_dropped_without_rebuilding_the_stream(self):
+        relay = FakeRelay(handler=lambda call, _count:
+                          (400, {"error": {"code": "invalid_request"}})
+                          if call["path"] == "/v1/events" else None)
+        hook_obj = self.make_hook(relay)
+        self.with_features(hook_obj, ["finished"])
+        hook_obj.run_event(event_json(status="done"))
+
+        self.assertEqual(len(relay.events()), 1)
+        self.assertEqual(
+            len([post for post in relay.posts if post["path"] == "/v1/streams"]), 1
+        )
+        self.assertFalse(hook_obj.load()["pending"])
+        self.assertEqual(hook_obj.load()["features"], [])
+
+    def test_startup_saves_advertised_features(self):
+        relay = FakeRelay(service_info={"features": ["sealed", "finished"]})
+        hook_obj = self.make_hook(relay)
+        hook_obj.run_startup()
+        state = hook_obj.load()
+        self.assertEqual(state["features"], ["sealed", "finished"])
+        self.assertEqual(state["features_version"], hook.PLUGIN_VERSION)
+
+    def test_startup_keeps_known_features_when_service_info_fails(self):
+        relay = FakeRelay()
+        hook_obj = self.make_hook(relay)
+        self.with_features(hook_obj, ["sealed"])
+        original = relay.get
+
+        def get(path, timeout=None):
+            if path == "/v1/service-info":
+                return None, None
+            return original(path)
+
+        relay.get = get
+        hook_obj.run_startup()
+        self.assertEqual(hook_obj.load()["features"], ["sealed"])
+
+
+class BudgetTests(HookTestCase):
+    def test_no_content_or_fingerprint_when_the_budget_is_gone(self):
+        relay = FakeRelay()
+        pane_calls, fetch_calls = [], []
+        hook_obj = self.make_hook(
+            relay,
+            pane=lambda pane_id, timeout: pane_calls.append(pane_id)
+            or (True, {"terminal_id": "term-1"}),
+            content_key=CONTENT_KEY,
+            fetch_content=lambda pane_id, kind, remaining, pane: fetch_calls.append(
+                pane_id
+            )
+            or dict(CONTENT),
+        )
+        self.with_features(hook_obj, ["sealed"])
+        hook_obj.deadline = self.monotonic_clock[0]
+        hook_obj.run_event(event_json())
+
+        self.assertFalse(pane_calls)
+        self.assertFalse(fetch_calls)
+        self.assertFalse(relay.events())
+        event = hook_obj.load()["pending"][0]
+        self.assertNotIn("sealed", event)
+        self.assertIsNone(event["pane_fingerprint"])
+
+    def test_content_budget_is_capped_by_the_remaining_time(self):
+        relay = FakeRelay()
+        pane_calls, fetch_calls = [], []
+        hook_obj = self.make_hook(
+            relay,
+            pane=lambda pane_id, timeout: pane_calls.append(timeout)
+            or (True, {"terminal_id": "term-1"}),
+            content_key=CONTENT_KEY,
+            fetch_content=lambda pane_id, kind, remaining, pane: fetch_calls.append(
+                remaining
+            )
+            or dict(CONTENT),
+        )
+        self.with_features(hook_obj, ["sealed"])
+        hook_obj.deadline = self.monotonic_clock[0] + 2.5
+        hook_obj.run_event(event_json())
+
+        self.assertEqual(len(pane_calls), 1)
+        self.assertGreater(pane_calls[0], 0)
+        self.assertLessEqual(pane_calls[0], 2.5)
+        self.assertEqual(len(fetch_calls), 1)
+        self.assertGreater(fetch_calls[0], 0)
+        self.assertLessEqual(fetch_calls[0], 2.5)
+        self.assertIn("sealed", relay.events()[0]["body"])
+
+    def test_spooled_events_take_no_content(self):
+        relay = FakeRelay()
+        pane_calls, fetch_calls = [], []
+        hook_obj = self.make_hook(
+            relay,
+            pane=lambda pane_id, timeout: pane_calls.append(pane_id)
+            or (True, {"terminal_id": "term-1"}),
+            content_key=CONTENT_KEY,
+            fetch_content=lambda pane_id, kind, remaining, pane: fetch_calls.append(
+                pane_id
+            )
+            or dict(CONTENT),
+        )
+        self.with_features(hook_obj, ["sealed"])
+        hook.spool_event(self.host_dir, event_json(pane_id="w9:p1"))
+        hook_obj.run_event(event_json(pane_id="w9:p2"))
+
+        self.assertNotIn("w9:p1", pane_calls)
+        self.assertNotIn("w9:p1", fetch_calls)
+        sealed = {
+            event["body"]["pane_id"]: event["body"].get("sealed")
+            for event in relay.events()
+        }
+        self.assertIsNone(sealed["w9:p1"])
+        self.assertIsNotNone(sealed["w9:p2"])
+
+    def test_startup_takes_no_content(self):
+        relay = FakeRelay(service_info={"features": ["sealed", "finished"]})
+        pane_calls, fetch_calls = [], []
+        hook_obj = self.make_hook(
+            relay,
+            pane=lambda pane_id, timeout: pane_calls.append(pane_id)
+            or (True, {"terminal_id": "term-1"}),
+            content_key=CONTENT_KEY,
+            fetch_content=lambda pane_id, kind, remaining, pane: fetch_calls.append(
+                pane_id
+            )
+            or dict(CONTENT),
+        )
+        hook.spool_event(self.host_dir, event_json(pane_id="w9:p1"))
+        hook_obj.run_startup()
+
+        self.assertFalse(pane_calls)
+        self.assertFalse(fetch_calls)
+
+    def test_blocked_event_uses_one_pane_get_for_fingerprint_and_content(self):
+        from tests.test_content import FakeHerdr
+
+        herdr = FakeHerdr()
+        relay = FakeRelay()
+        hook_obj = self.make_hook(
+            relay, pane=hook.herdr_pane, content_key=CONTENT_KEY
+        )
+        self.with_features(hook_obj, ["sealed"])
+        with unittest.mock.patch("hook.subprocess.run", side_effect=herdr.run):
+            hook_obj.run_event(event_json())
+
+        self.assertEqual(
+            sum(1 for args, _timeout in herdr.calls if args[:2] == ("pane", "get")), 1
+        )
+        body = relay.events()[0]["body"]
+        self.assertIn("sealed", body)
+        self.assertEqual(
+            body["pane_fingerprint"], hook.pane_fingerprint(HOST_ID, "term-1")
+        )
+
+    def test_finished_event_does_not_call_pane_read(self):
+        from tests.test_content import FakeHerdr
+
+        herdr = FakeHerdr()
+        relay = FakeRelay()
+        hook_obj = self.make_hook(
+            relay, pane=hook.herdr_pane, content_key=CONTENT_KEY
+        )
+        self.with_features(hook_obj, ["sealed", "finished"])
+        with unittest.mock.patch("hook.subprocess.run", side_effect=herdr.run):
+            hook_obj.run_event(event_json(status="done"))
+
+        self.assertFalse(
+            any(args[:2] == ("pane", "read") for args, _timeout in herdr.calls)
+        )
+        self.assertIn("sealed", relay.events()[0]["body"])
+
+    def test_400_service_info_recheck_respects_the_budget(self):
+        hook_obj = None
+
+        def handler(call, _count):
+            if call["path"] == "/v1/events":
+                self.monotonic_clock[0] = hook_obj.deadline + 1
+                return 400, {"error": {"code": "invalid_request"}}
+            return None
+
+        relay = FakeRelay(handler=handler)
+        hook_obj = self.make_hook(
+            relay, content_key=CONTENT_KEY,
+            fetch_content=lambda pane_id, kind, remaining, pane: dict(CONTENT),
+        )
+        self.with_features(hook_obj, ["sealed"])
+        hook_obj.run_event(event_json())
+
+        self.assertNotIn("/v1/service-info", relay.gets)
+        self.assertEqual(len(relay.events()), 1)
+        self.assertFalse(hook_obj.load()["pending"][0].get("sealed"))
+
+    def test_a_short_budget_pane_get_failure_keeps_the_event(self):
+        relay = FakeRelay()
+        hook_obj = self.make_hook(
+            relay, pane=lambda pane_id, timeout: (False, None)
+        )
+        state = hook_obj.load()
+        state["features_version"] = hook.PLUGIN_VERSION
+        state["panes"]["w9:p1"] = {
+            "pane_generation": "generation-1",
+            "pane_fingerprint": "f" * 64,
+            "last_state": "clear",
+        }
+        hook_obj.save(state)
+        hook_obj.deadline = self.monotonic_clock[0] + 1
+
+        hook_obj.run_event(event_json())
+
+        events = relay.events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["body"]["pane_fingerprint"], "f" * 64)
+
+    def test_a_streamless_event_never_starts_a_call_past_the_budget(self):
+        deadline = self.monotonic_clock[0] + hook.HOOK_BUDGET_SECONDS
+        calls = []
+        relay = FakeRelay()
+
+        def timed(kind, timeout, cost):
+            calls.append((kind, timeout, self.monotonic_clock[0]))
+            self.monotonic_clock[0] += cost if timeout is None else min(cost, timeout)
+
+        def get(path, timeout=None):
+            timed("get " + path, timeout, 8)
+            if path == "/v1/service-info":
+                return 200, {"features": ["sealed"]}
+            return 200, dict(ready_settings())
+
+        relay.get = get
+
+        def post(path, body, idempotency_key=None, timeout=None):
+            timed("post " + path, timeout, 5 if path == "/v1/streams" else 8)
+            if path == "/v1/streams":
+                return 201, {
+                    "stream_id": "stream-1",
+                    "last_sequence": 0,
+                    "expires_at": "2099-01-01T00:00:00.000Z",
+                }
+            return 202, {}
+
+        relay.post = post
+        hook_obj = self.make_hook(
+            relay,
+            blocked=lambda timeout: timed("agent list", timeout, 10) or [],
+            pane=lambda pane_id, timeout: timed("pane", timeout, 10)
+            or (True, {"terminal_id": "term-1"}),
+            content_key=CONTENT_KEY,
+            fetch_content=lambda pane_id, kind, remaining, pane: timed(
+                "content", remaining, 12
+            )
+            or dict(CONTENT),
+        )
+        hook_obj.deadline = deadline
+        hook_obj.run_event(event_json())
+
+        self.assertTrue(calls)
+        for kind, timeout, at in calls:
+            self.assertIsNotNone(timeout, kind)
+            self.assertGreater(timeout, 0, kind)
+            self.assertLessEqual(at + timeout, deadline + 1e-9, kind)
+        self.assertLessEqual(self.monotonic_clock[0], deadline + 1e-9)
+        self.assertTrue(hook_obj.load()["pending"])
+
+    def test_stream_and_event_posts_are_capped(self):
+        relay = FakeRelay()
+        calls = []
+
+        def get(path, timeout=None):
+            calls.append(("get " + path, timeout, self.monotonic_clock[0]))
+            self.monotonic_clock[0] += timeout if timeout is not None else 8
+            return 200, dict(ready_settings())
+
+        relay.get = get
+
+        def post(path, body, idempotency_key=None, timeout=None):
+            calls.append(("post " + path, timeout, self.monotonic_clock[0]))
+            self.monotonic_clock[0] += timeout if timeout is not None else 8
+            if path == "/v1/streams":
+                return 201, {
+                    "stream_id": "stream-1",
+                    "last_sequence": 0,
+                    "expires_at": "2099-01-01T00:00:00.000Z",
+                }
+            return 202, {}
+
+        relay.post = post
+        hook_obj = self.make_hook(
+            relay,
+            blocked=lambda timeout: [],
+        )
+        state = hook_obj.load()
+        state["features_version"] = hook.PLUGIN_VERSION
+        hook_obj.save(state)
+        hook_obj.deadline = self.monotonic_clock[0] + 20
+        hook_obj.run_event(event_json())
+
+        by_name = {name: timeout for name, timeout, _at in calls}
+        self.assertGreater(by_name["get /v1/source-settings"], 0)
+        self.assertGreater(by_name["post /v1/streams"], 0)
+        self.assertGreater(by_name["post /v1/events"], 0)
+        self.assertEqual(hook_obj.load()["sequence"], 1)
+        for name, timeout, at in calls:
+            self.assertLessEqual(at + timeout, hook_obj.deadline + 1e-9, name)
+
+
+class FeatureRefreshTests(HookTestCase):
+    def test_old_state_reads_features_on_the_next_event(self):
+        relay = FakeRelay(service_info={"features": ["sealed", "finished"]})
+        hook_obj = self.make_hook(
+            relay, content_key=CONTENT_KEY,
+            fetch_content=lambda pane_id, kind, remaining, pane: dict(CONTENT),
+        )
+        hook_obj.run_event(event_json())
+
+        state = hook_obj.load()
+        self.assertEqual(state["features"], ["sealed", "finished"])
+        self.assertEqual(state["features_version"], hook.PLUGIN_VERSION)
+        self.assertIn("sealed", relay.events()[0]["body"])
+
+    def test_version_mismatch_reads_features_once(self):
+        relay = FakeRelay(service_info={"features": ["sealed"]})
+        hook_obj = self.make_hook(
+            relay, content_key=CONTENT_KEY,
+            fetch_content=lambda pane_id, kind, remaining, pane: dict(CONTENT),
+        )
+        self.with_features(hook_obj, [], version="0.2.0")
+        hook_obj.run_event(event_json(pane_id="w9:p1"))
+
+        self.assertEqual(hook_obj.load()["features"], ["sealed"])
+        self.assertEqual(relay.gets.count("/v1/service-info"), 1)
+        hook_obj.run_event(event_json(pane_id="w9:p2"))
+        self.assertEqual(relay.gets.count("/v1/service-info"), 1)
+
+    def test_a_failed_startup_read_is_retried_on_the_next_event(self):
+        relay = FakeRelay(service_info={"features": ["finished"]})
+        hook_obj = self.make_hook(relay)
+        original = relay.get
+
+        def failing(path, timeout=None):
+            if path == "/v1/service-info":
+                return None, None
+            return original(path, timeout)
+
+        relay.get = failing
+        hook_obj.run_startup()
+        self.assertIsNone(hook_obj.load()["features_version"])
+
+        relay.get = original
+        hook_obj.run_event(event_json(status="done"))
+        self.assertEqual(hook_obj.load()["features"], ["finished"])
+
+
+class StreamErrorTests(HookTestCase):
+    def check(self, status):
+        def handler(call, _count):
+            if call["path"] == "/v1/events" and call["body"]["state"] == "clear":
+                code = "stale_stream" if status == 409 else "invalid_request"
+                return status, {"error": {"code": code}}
+            return None
+
+        relay = FakeRelay(handler=handler)
+        hook_obj = self.make_hook(relay)
+        self.with_features(hook_obj, ["finished"])
+        hook_obj.run_event(event_json(status="blocked"))
+        hook_obj.run_event(event_json(status="done"))
+
+        events = relay.events()
+        self.assertEqual(
+            [event["body"]["state"] for event in events],
+            ["blocked", "clear", "finished"],
+        )
+        # resync で作った新しい stream の sequence で finished が送られる。
+        self.assertEqual(events[-1]["body"]["sequence"], 1)
+        self.assertFalse(hook_obj.load()["pending"])
+
+    def test_clear_400_still_delivers_finished(self):
+        self.check(400)
+
+    def test_clear_409_still_delivers_finished(self):
+        self.check(409)
+
+    def test_clear_404_still_delivers_finished(self):
+        self.check(404)
+
+    def test_clear_410_drops_finished_without_another_stream(self):
+        posts = {"events": 0}
+
+        def handler(call, _count):
+            if call["path"] != "/v1/events":
+                return None
+            posts["events"] += 1
+            if posts["events"] > 10:
+                return 500, {"error": {"code": "internal_error"}}
+            if call["body"]["state"] in ("clear", "finished"):
+                return 410, {"error": {"code": "expired"}}
+            return None
+
+        relay = FakeRelay(handler=handler)
+        hook_obj = self.make_hook(relay)
+        self.with_features(hook_obj, ["finished"])
+        hook_obj.run_event(event_json(status="blocked"))
+        hook_obj.run_event(event_json(status="done"))
+
+        self.assertEqual(
+            [event["body"]["state"] for event in relay.events()],
+            ["blocked", "clear", "finished"],
+        )
+        self.assertEqual(
+            len([post for post in relay.posts if post["path"] == "/v1/streams"]), 1
+        )
+        self.assertFalse(hook_obj.load()["pending"])
+
+
+class FinishedFailureTests(HookTestCase):
+    def test_finished_409_stale_stream_is_resent_once(self):
+        attempts = {"finished": 0}
+
+        def handler(call, _count):
+            if call["path"] == "/v1/events" and call["body"]["state"] == "finished":
+                attempts["finished"] += 1
+                if attempts["finished"] == 1:
+                    return 409, {"error": {"code": "stale_stream"}}
+            return None
+
+        relay = FakeRelay(handler=handler)
+        hook_obj = self.make_hook(relay)
+        self.with_features(hook_obj, ["finished"])
+        hook_obj.run_event(event_json(status="done"))
+
+        self.assertEqual(
+            [event["body"]["state"] for event in relay.events()],
+            ["finished", "finished"],
+        )
+        self.assertEqual(
+            len([post for post in relay.posts if post["path"] == "/v1/streams"]), 2
+        )
+        self.assertFalse(hook_obj.load()["pending"])
+
+    def test_finished_404_is_resent_once(self):
+        attempts = {"finished": 0}
+
+        def handler(call, _count):
+            if call["path"] == "/v1/events" and call["body"]["state"] == "finished":
+                attempts["finished"] += 1
+                if attempts["finished"] == 1:
+                    return 404, {"error": {"code": "not_found"}}
+            return None
+
+        relay = FakeRelay(handler=handler)
+        hook_obj = self.make_hook(relay)
+        self.with_features(hook_obj, ["finished"])
+        hook_obj.run_event(event_json(status="done"))
+
+        self.assertEqual(
+            [event["body"]["state"] for event in relay.events()],
+            ["finished", "finished"],
+        )
+        self.assertFalse(hook_obj.load()["pending"])
+
+    def test_expired_finished_410_is_dropped_without_a_new_stream(self):
+        posts = {"events": 0}
+
+        def handler(call, _count):
+            if call["path"] != "/v1/events":
+                return None
+            posts["events"] += 1
+            if posts["events"] > 10:
+                return 500, {"error": {"code": "internal_error"}}
+            if call["body"]["state"] == "finished":
+                return 410, {"error": {"code": "expired"}}
+            return None
+
+        relay = FakeRelay(handler=handler)
+        hook_obj = self.make_hook(relay)
+        self.with_features(hook_obj, ["finished"])
+        hook_obj.run_event(event_json(status="done"))
+
+        self.assertEqual(
+            [event["body"]["state"] for event in relay.events()], ["finished"]
+        )
+        self.assertEqual(
+            len([post for post in relay.posts if post["path"] == "/v1/streams"]), 1
+        )
+        self.assertFalse(hook_obj.load()["pending"])
+
+    def test_finished_idempotency_conflict_is_treated_as_accepted(self):
+        posts = {"events": 0}
+
+        def handler(call, _count):
+            if call["path"] != "/v1/events":
+                return None
+            posts["events"] += 1
+            if posts["events"] > 10:
+                return 500, {"error": {"code": "internal_error"}}
+            if call["body"]["state"] == "finished":
+                return 409, {"error": {"code": "idempotency_conflict"}}
+            return None
+
+        relay = FakeRelay(handler=handler)
+        hook_obj = self.make_hook(relay)
+        self.with_features(hook_obj, ["finished"])
+        hook_obj.run_event(event_json(status="done"))
+
+        self.assertEqual(
+            [event["body"]["state"] for event in relay.events()], ["finished"]
+        )
+        self.assertEqual(
+            len([post for post in relay.posts if post["path"] == "/v1/streams"]), 1
+        )
+        self.assertFalse(hook_obj.load()["pending"])
+
+    def test_finished_survives_a_resync_while_upload_is_not_ready(self):
+        def handler(call, _count):
+            if call["path"] == "/v1/events" and call["body"]["state"] == "clear":
+                return 409, {"error": {"code": "stale_stream"}}
+            return None
+
+        relay = FakeRelay(
+            settings=ready_settings(upload_state="no_links"), handler=handler
+        )
+        hook_obj = self.make_hook(relay)
+        state = hook_obj.load()
+        state["features"] = ["finished"]
+        state["features_version"] = hook.PLUGIN_VERSION
+        state["stream_id"] = "stream-1"
+        state["stream_expires_at"] = "2099-01-01T00:00:00.000Z"
+        hook_obj.enqueue(state, "w9:p1", "clear", "generation-1", None)
+        hook_obj.enqueue(state, "w9:p1", "finished", "generation-1", None)
+        hook_obj.save(state)
+
+        hook_obj.run_event(event_json(pane_id="w9:p2", status="idle"))
+
+        state = hook_obj.load()
+        self.assertTrue(state["suspended"])
+        self.assertEqual([event["state"] for event in state["pending"]], ["finished"])
+
+    def test_finished_survives_upload_suspended(self):
+        relay = FakeRelay(
+            handler=lambda call, _count: (409, {"error": {"code": "upload_suspended"}})
+            if call["path"] == "/v1/events"
+            else None
+        )
+        hook_obj = self.make_hook(relay)
+        state = hook_obj.load()
+        state["features"] = ["finished"]
+        state["features_version"] = hook.PLUGIN_VERSION
+        state["stream_id"] = "stream-1"
+        state["stream_expires_at"] = "2099-01-01T00:00:00.000Z"
+        hook_obj.enqueue(state, "w9:p1", "finished", "generation-1", None)
+        hook_obj.save(state)
+
+        hook_obj.run_event(event_json(pane_id="w9:p2", status="idle"))
+
+        state = hook_obj.load()
+        self.assertTrue(state["suspended"])
+        self.assertEqual([event["state"] for event in state["pending"]], ["finished"])
+
+    def test_multiple_finished_keep_their_order_after_resync(self):
+        attempts = {"finished": 0}
+
+        def handler(call, _count):
+            if call["path"] == "/v1/events" and call["body"]["state"] == "finished":
+                attempts["finished"] += 1
+                if attempts["finished"] == 1:
+                    return 409, {"error": {"code": "stale_stream"}}
+            return None
+
+        relay = FakeRelay(handler=handler)
+        hook_obj = self.make_hook(relay)
+        state = hook_obj.load()
+        state["features"] = ["finished"]
+        state["features_version"] = hook.PLUGIN_VERSION
+        state["stream_id"] = "stream-1"
+        state["stream_expires_at"] = "2099-01-01T00:00:00.000Z"
+        hook_obj.enqueue(state, "w9:p1", "finished", "generation-1", None)
+        hook_obj.enqueue(state, "w9:p2", "finished", "generation-2", None)
+        hook_obj.save(state)
+
+        hook_obj.run_event(event_json(pane_id="w9:p3", status="idle"))
+
+        events = relay.events()
+        self.assertEqual(
+            [event["body"]["pane_id"] for event in events],
+            ["w9:p1", "w9:p1", "w9:p2"],
+        )
+        self.assertEqual([event["body"]["sequence"] for event in events], [1, 1, 2])
+        self.assertFalse(hook_obj.load()["pending"])
+
+
+class SpoolFingerprintTests(HookTestCase):
+    def test_spooled_blocked_reuses_the_previous_fingerprint(self):
+        known = {}
+
+        def handler(call, _count):
+            if call["path"] != "/v1/events":
+                return None
+            body = call["body"]
+            previous = known.get(body["pane_id"])
+            if (
+                previous is not None
+                and previous[0] == body["pane_generation"]
+                and previous[1] != body["pane_fingerprint"]
+            ):
+                return 409, {"error": {"code": "conflict"}}
+            known[body["pane_id"]] = (
+                body["pane_generation"],
+                body["pane_fingerprint"],
+            )
+            return None
+
+        relay = FakeRelay(handler=handler)
+        hook_obj = self.make_hook(relay)
+        hook_obj.run_event(event_json(status="blocked"))
+        hook_obj.run_event(event_json(status="idle"))
+        hook.spool_event(self.host_dir, event_json(status="blocked"))
+        hook_obj.run_event(event_json(pane_id="w9:p2", status="idle"))
+
+        self.assertEqual(
+            [event["body"]["state"] for event in relay.events()],
+            ["blocked", "clear", "blocked"],
+        )
+        self.assertEqual(
+            relay.events()[-1]["body"]["pane_fingerprint"],
+            hook.pane_fingerprint(HOST_ID, "term-1"),
+        )
+        self.assertEqual(
+            len([post for post in relay.posts if post["path"] == "/v1/streams"]), 1
+        )
+
+
+class StateCompatTests(HookTestCase):
+    def test_a_0_2_0_state_without_features_still_loads(self):
+        state = hook._make_state(HOST_ID)
+        state["stream_id"] = "stream-1"
+        del state["features"]
+        del state["features_version"]
+        os.makedirs(self.host_dir)
+        with open(os.path.join(self.host_dir, "state.json"), "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+
+        loaded = hook.load_state(self.host_dir, HOST_ID, now=1000)
+
+        self.assertEqual(loaded["stream_id"], "stream-1")
+        self.assertEqual(loaded["features"], [])
+        self.assertIsNone(loaded["features_version"])
+
+
+class VersionTests(unittest.TestCase):
+    def test_plugin_version_matches_the_manifest(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "herdr-plugin.toml"), encoding="utf-8") as handle:
+            manifest = handle.read()
+        self.assertIn('version = "%s"' % hook.PLUGIN_VERSION, manifest)
+
+
 class LockTests(HookTestCase):
     def test_budgets_match_contract(self):
         # A hook gets 45 seconds in total; one lock wait gives up after 5.
@@ -788,19 +1696,19 @@ class LockTests(HookTestCase):
 
     def test_spooled_event_is_persisted_when_drain_exhausts_budget(self):
         relay = FakeRelay()
-        terminal_calls = []
+        pane_calls = []
 
-        def terminal(pane_id):
-            terminal_calls.append(pane_id)
-            return True, "term-1"
+        def pane(pane_id, timeout):
+            pane_calls.append(pane_id)
+            return True, {"terminal_id": "term-1"}
 
-        hook_obj = self.make_hook(relay, terminal=terminal)
+        hook_obj = self.make_hook(relay, pane=pane)
 
         def spool_during_retry(call, _index):
             if call["path"] != "/v1/events":
                 return None
             hook.spool_event(hook_obj.state_dir, event_json(pane_id="w9:p2"))
-            hook_obj.deadline = time.monotonic() - 1
+            hook_obj.deadline = self.monotonic_clock[0] - 1
             return 429, {"error": {"retry_after_seconds": 60}}
 
         relay.handler = spool_during_retry
@@ -812,7 +1720,7 @@ class LockTests(HookTestCase):
         self.assertGreater(
             hook.parse_iso_utc(state["pending"][1]["expires_at"]), hook_obj.now()
         )
-        self.assertEqual(terminal_calls, ["w9:p1"])
+        self.assertEqual(pane_calls, ["w9:p1"])
         self.assertIsNone(state["pending"][1]["pane_fingerprint"])
 
     def test_ingest_does_not_remove_a_writing_temp_file(self):

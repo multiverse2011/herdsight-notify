@@ -135,7 +135,17 @@ class PairTests(unittest.TestCase):
         pair_id, _sep, secret = lines[0]["pair"].partition(".")
         setup.parse_pair_string(lines[0]["pair"])
         self.assertEqual(lines[0]["expires_at"], "2026-11-14T00:05:00Z")
-        self.assertEqual(lines[1], {"v": 1, "result": "approved", "link_id": "link-1", "host_id": HOST_ID})
+        self.assertEqual(lines[1]["v"], 1)
+        self.assertEqual(lines[1]["result"], "approved")
+        self.assertEqual(lines[1]["link_id"], "link-1")
+        self.assertEqual(lines[1]["host_id"], HOST_ID)
+        self.assertRegex(lines[1]["content_key"], setup.BASE64URL)
+        key_path = setup.content_key_path(os.path.dirname(self.config_path))
+        self.assertEqual(os.stat(key_path).st_mode & 0o777, 0o600)
+        with open(key_path, "rb") as handle:
+            self.assertEqual(
+                setup.content_key_encode(handle.read()), lines[1]["content_key"]
+            )
         self.assertEqual(relay.keys(), ["service", "hosts", "create", "get", "get", "approve"])
         config = self.read_config()
         self.assertEqual(config["relay_url"], RELAY)
@@ -241,6 +251,7 @@ class PairTests(unittest.TestCase):
 
     def test_rejected_host_is_replaced_once_without_delete_self(self):
         self.write_config({"relay_url": RELAY, "hosts": [self.host("old-host")]})
+        key = setup.load_or_create_content_key(os.path.dirname(self.config_path))
         relay = FakeRelay(create=[(401, None), (201, {"expires_at": "x"})])
         result, _lines = self.run_pair(relay)
         self.assertEqual(result, 0)
@@ -250,6 +261,10 @@ class PairTests(unittest.TestCase):
         self.assertEqual(len(hosts), 1)
         self.assertNotEqual(hosts[0]["host_secret"], "s" * 43)
         self.assertEqual(hosts[0]["workspace_allowlist"], ["w1"])
+        # 401 の回復で鍵を作り直さない。
+        self.assertEqual(
+            setup.load_or_create_content_key(os.path.dirname(self.config_path)), key
+        )
 
     def test_host_rejected_after_recovery(self):
         self.write_config({"relay_url": RELAY, "hosts": [self.host("old-host")]})

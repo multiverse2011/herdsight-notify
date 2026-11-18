@@ -1,12 +1,20 @@
 # Herdsight Notify (herdr plugin)
 
-Sends a generic push notification through the Herdsight relay when an agent in this
-herdr session needs input. The hook is a short-lived `python3` process (standard library
-only, Python 3.9+), started by herdr for each `pane.agent_status_changed` event and once at
-startup. macOS only (herdr 0.9.5 or later).
+Sends a push notification through the Herdsight relay when an agent in this herdr session
+needs input, and another when it finishes. The hook is a short-lived `python3` process
+(standard library only, Python 3.9+), started by herdr for each `pane.agent_status_changed`
+event and once at startup. macOS only (herdr 0.9.5 or later).
 
-The notification carries no terminal content: the relay only learns that some pane is
-blocked.
+The notification content (agent kind, workspace and tab names, pane title, the first line
+of the confirmation prompt) is sealed with a key that stays on this Mac. The relay only
+forwards the ciphertext and cannot read it; the Herdsight app decrypts it on the device.
+A Mac without a content key, or paired with an app that has no key, still gets the generic
+notification. Nothing decrypted is written to stderr or the plugin log; the sealed value
+stays in `state.json` only until the event has been sent.
+
+The plugin uses the relay features advertised by `GET /v1/service-info`. Against a relay
+that does not announce `sealed` or `finished` it sends plain generic events and no finished
+notifications.
 
 ## Set up from the iPhone app
 
@@ -19,13 +27,21 @@ login shell. It then runs:
 cd <plugin root> && /usr/bin/python3 setup.py pair --relay-url <relay URL>
 ```
 
-`pair` creates the pairing, prints it as one JSON line, reads the 8-digit code the app got
-from the relay on stdin, compares it with the relay's code and approves it. There is no code to
-compare by hand: the host key you approved stands in for that check. `pair` never prompts,
-writes only JSON lines to stdout (`{"v":1,"pair":…}`, then `{"v":1,"result":"approved",…}` or
-`{"v":1,"error":"<code>"}`), and cancels the pairing if stdin closes early. It refuses to
-switch a Mac that is already set up for a different relay (`relay_mismatch`); run uninstall
-first to switch relays.
+`pair` creates the pairing and the Mac's content key, prints the pairing as one JSON line,
+reads the 8-digit code the app got from the relay on stdin, compares it with the relay's
+code and approves it. The approved line also carries `content_key` (unpadded base64url) for
+the app to store; a device already paired without a key can fetch it with `content-key`:
+
+```bash
+cd <plugin root> && /usr/bin/python3 setup.py content-key
+```
+
+That prints `{"v":1,"content_key":"…"}` and creates the key if the config directory exists
+but has none. There is no code to compare by hand: the host key you approved stands in for
+that check. `pair` never prompts, writes only JSON lines to stdout
+(`{"v":1,"pair":…}`, then `{"v":1,"result":"approved",…}` or `{"v":1,"error":"<code>"}`),
+and cancels the pairing if stdin closes early. It refuses to switch a Mac that is already
+set up for a different relay (`relay_mismatch`); run uninstall first to switch relays.
 
 The app needs `/usr/bin/python3` (Command Line Tools) on the Mac.
 
@@ -42,7 +58,9 @@ herdr plugin pane open --plugin herdsight.notify --entrypoint setup
 The second command opens the setup pane inside herdr. Then:
 
 1. Setup prints a pairing string `<pair_id>.<claim_secret>` and copies it to the clipboard.
-   With Universal Clipboard it is already on your iPhone.
+   With Universal Clipboard it is already on your iPhone. The content key is not part of
+   this string; the app fetches it over SSH with `content-key` when the host key is
+   approved. A manual-only pairing shows the generic notification.
 2. In the Herdsight app, open notification setup and paste the string within 5 minutes.
 3. The Mac and the app both show an 8-digit code. If they are the same, answer `y` on the
    Mac. Anything else (Enter, Ctrl-C) cancels the pairing. If the app shows no code, answer
@@ -81,6 +99,8 @@ python3 setup.py cancel <pair_id>
 
 - Config: `config.json` in `herdr plugin config-dir herdsight.notify`
   (or `HERDR_PLUGIN_CONFIG_DIR`). Contains the relay URL and the host credentials.
+  `content-key` in the same directory holds the 32-byte key that seals notification
+  content. It belongs to this Mac, not to a pairing.
 - State: `state.json` and `state.lock` in
   `~/.local/state/herdr/plugins/herdsight.notify/<host_id>/` (or
   `$HERDR_PLUGIN_STATE_DIR/<host_id>/`), one directory per paired host.
@@ -97,7 +117,9 @@ herdr plugin uninstall herdsight.notify
 
 The uninstall pane asks for confirmation first (`setup.py uninstall --yes` skips it).
 `setup.py uninstall` calls `DELETE /v1/self` for every configured host on the saved relay, then
-removes the local config, state, lock, and spool files. Run it **before**
+removes the local config, content key, state, lock, and spool files. Running setup after
+this creates a new content key, so devices that still have the old one fall back to the
+generic notification. Run it **before**
 `herdr plugin uninstall`, which only removes herdr's registration and leaves `config.json`
 and the state files behind. If any relay deletion fails, the command exits nonzero and keeps
 the local config and state so the cleanup can be retried.

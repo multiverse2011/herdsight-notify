@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import types
 import unittest
 import unittest.mock
@@ -72,6 +73,19 @@ class PairStringTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 setup.parse_pair_string(value)
 
+    def test_accepts_an_optional_content_key(self):
+        pair_id = str(uuid.uuid4())
+        secret = "a" * 43
+        key = "b" * 43
+        self.assertEqual(
+            setup.parse_pair_string("%s.%s.%s" % (pair_id, secret, key)),
+            (pair_id, secret),
+        )
+        with self.assertRaises(ValueError):
+            setup.parse_pair_string("%s.%s.%s" % (pair_id, secret, "short"))
+        with self.assertRaisesRegex(ValueError, "2 or 3 parts"):
+            setup.parse_pair_string("a.b.c.d")
+
     def test_rejects_non_v4_uuid(self):
         with self.assertRaises(ValueError):
             setup.parse_pair_string("11111111-1111-1111-8111-111111111111." + "a" * 43)
@@ -90,6 +104,105 @@ class SecretTests(unittest.TestCase):
         self.assertEqual(len(secret), 43)
         self.assertRegex(secret, setup.BASE64URL)
         self.assertNotEqual(secret, setup.random_secret())
+
+
+class ContentKeyTests(unittest.TestCase):
+    def test_created_once_as_32_bytes_with_mode_0600(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = os.path.join(tmp, "config")
+            key = setup.load_or_create_content_key(directory)
+            self.assertEqual(len(key), 32)
+            path = setup.content_key_path(directory)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+            self.assertEqual(setup.load_or_create_content_key(directory), key)
+
+    def test_concurrent_creation_returns_the_key_that_was_published(self):
+        real_fdopen = os.fdopen
+        created = threading.Event()
+        release = threading.Event()
+        lock = threading.Lock()
+        first = [True]
+
+        def fdopen(fd, mode="r", *args, **kwargs):
+            with lock:
+                take = first[0]
+                first[0] = False
+            if take:
+                created.set()
+                release.wait(5)
+            return real_fdopen(fd, mode, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            results = []
+
+            def create():
+                results.append(setup.load_or_create_content_key(tmp))
+
+            with unittest.mock.patch("setup.os.fdopen", side_effect=fdopen):
+                a = threading.Thread(target=create)
+                a.start()
+                self.assertTrue(created.wait(5))
+                b = threading.Thread(target=create)
+                b.start()
+                b.join(5)
+                release.set()
+                a.join(5)
+
+            with open(setup.content_key_path(tmp), "rb") as handle:
+                published = handle.read()
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results, [published, published])
+
+    def test_creating_a_key_removes_an_old_temp_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stale = os.path.join(tmp, ".content-key.old.tmp")
+            with open(stale, "wb") as handle:
+                handle.write(b"partial")
+            os.utime(stale, (0, 0))
+            setup.load_or_create_content_key(tmp)
+            self.assertFalse(os.path.exists(stale))
+
+    def test_creating_a_key_leaves_a_fresh_temp_file_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fresh = os.path.join(tmp, ".content-key.fresh.tmp")
+            with open(fresh, "wb") as handle:
+                handle.write(b"partial")
+            setup.load_or_create_content_key(tmp)
+            self.assertTrue(os.path.exists(fresh))
+
+    def test_a_short_key_file_is_replaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = setup.content_key_path(tmp)
+            with open(path, "wb") as handle:
+                handle.write(b"short")
+            key = setup.load_or_create_content_key(tmp)
+            self.assertEqual(len(key), 32)
+            with open(path, "rb") as handle:
+                self.assertEqual(handle.read(), key)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_content_key_command_prints_one_json_line_and_reuses_the_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with unittest.mock.patch.dict(
+                os.environ, {"HERDR_PLUGIN_CONFIG_DIR": tmp}, clear=True
+            ):
+                first = io.StringIO()
+                self.assertEqual(setup.run_content_key(first), 0)
+                second = io.StringIO()
+                self.assertEqual(setup.run_content_key(second), 0)
+            line = json.loads(first.getvalue())
+            self.assertEqual(line["v"], 1)
+            self.assertRegex(line["content_key"], setup.BASE64URL)
+            self.assertEqual(json.loads(second.getvalue()), line)
+            self.assertEqual(len(first.getvalue().splitlines()), 1)
+
+    def test_content_key_command_reports_a_missing_config_dir(self):
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict(
+            os.environ, {"HERDR_PLUGIN_CONFIG_DIR": os.path.join(tmp, "none")}, clear=True
+        ):
+            output = io.StringIO()
+            self.assertEqual(setup.run_content_key(output), 1)
+        self.assertEqual(json.loads(output.getvalue()), {"v": 1, "error": "config_error"})
 
 
 class ConfigFileTests(unittest.TestCase):
@@ -693,6 +806,16 @@ class MainTests(unittest.TestCase):
         client_class.assert_called_once_with(setup.DEFAULT_RELAY_URL, None)
         self.assertIn("Using herdr socket: %s" % self.socket, output)
         self.assertIn("Paired.", output)
+        pair_line = next(
+            line for line in output.splitlines() if line.startswith("Pairing code")
+        )
+        # 0.2.0 までのアプリは2つ目以降を claim secret として送るので、手動の文字列は2分割のまま。
+        self.assertEqual(len(pair_line.rsplit(": ", 1)[1].split(".")), 2)
+        self.assertEqual(
+            os.stat(setup.content_key_path(os.path.dirname(self.config_path))).st_mode
+            & 0o777,
+            0o600,
+        )
         config = setup.load_config(self.config_path)
         self.assertEqual(config["relay_url"], setup.DEFAULT_RELAY_URL)
         self.assertEqual(config["hosts"][0]["socket_path"], self.socket)
@@ -780,6 +903,11 @@ class UninstallTests(unittest.TestCase):
             os.makedirs(state_dir)
             config_path = os.path.join(config_dir, "config.json")
             setup.save_config(config_path, config)
+            key_path = setup.content_key_path(config_dir)
+            setup.load_or_create_content_key(config_dir)
+            temp_key = os.path.join(config_dir, ".content-key.stale.tmp")
+            with open(temp_key, "wb") as handle:
+                handle.write(b"partial")
             for name in ("state.json", "state.lock", "state.json.corrupt-123"):
                 with open(os.path.join(state_dir, name), "w", encoding="utf-8") as handle:
                     handle.write("{}")
@@ -794,6 +922,8 @@ class UninstallTests(unittest.TestCase):
             )
 
             self.assertFalse(os.path.exists(config_path))
+            self.assertFalse(os.path.exists(key_path))
+            self.assertFalse(os.path.exists(temp_key))
             self.assertEqual(os.listdir(state_dir), [])
             req = opener.calls[0]
             self.assertEqual(req.get_method(), "DELETE")

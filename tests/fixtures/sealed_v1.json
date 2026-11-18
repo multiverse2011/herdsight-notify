@@ -1,0 +1,7 @@
+{
+  "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "nonce": "AAECAwQFBgcICQoL",
+  "aad": "herdsight-content-v1:needs_input",
+  "plaintext": "{\"v\":1,\"agent\":\"claude\",\"workspace\":\"herdsight\",\"tab\":\"main\",\"title\":\"Fix the login flow\",\"prompt\":\"テストを直してよいですか？\"}",
+  "sealed": "AAECAwQFBgcICQoL8tl-IhMmiWLW5Fqd7D80Qaoc05I1EY-VxOBAtx6z1l2P5Q7JxHbU6lNBH78N4K0PXPDIFt8SmvZz0bclvG3qvw0U2e_fNmqAvDY51H1csJ69tykSCQafSSx70n6qEm_POfxW0RRaoRcz4hA0KnI1Eg704tsIyqN56Y62V5q-O6UgwSA8MNBe56av4FhRcypS9Z8PfU1rMuggFL9qTA"
+}

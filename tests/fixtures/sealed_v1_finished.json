@@ -1,0 +1,7 @@
+{
+  "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "nonce": "DA0ODxAREhMUFRYX",
+  "aad": "herdsight-content-v1:finished",
+  "plaintext": "{\"v\":1,\"agent\":\"claude\",\"workspace\":\"herdsight\",\"tab\":\"main\",\"title\":\"Fix the login flow\",\"prompt\":null}",
+  "sealed": "DA0ODxAREhMUFRYXJ3FOtGQ1Mg_k5tQV23nLPN5UU5WIC0SI0ba3txPggAvSzjwaPq-VVl6s1ZhwmKwZYWjEj1SwOcBEQBuJaZ7rPzuq0EJRWUgAezE-r1Y6Lc5vrRD5-IQJr9TAwNSwlDdgQg_EldsOrMLCTcy0p6Y6hXQ_1Ax0bEqf"
+}

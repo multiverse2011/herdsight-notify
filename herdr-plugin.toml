@@ -1,8 +1,8 @@
 id = "herdsight.notify"
 name = "Herdsight Notify"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.9.5"
-description = "Send generic push notifications when a herdr agent needs input."
+description = "Send push notifications when a herdr agent needs input or finishes."
 platforms = ["macos"]
 
 [[startup]]

@@ -9,6 +9,7 @@ HERDR_PLUGIN_CONFIG_DIR (or `herdr plugin config-dir`), never to the plugin root
 """
 
 import argparse
+import base64
 import contextlib
 import glob
 import hmac
@@ -37,6 +38,8 @@ DEFAULT_RELAY_URL = "https://relay.ayushio.com"
 RETRY_WINDOW_SECONDS = PAIRING_LIFETIME_SECONDS
 MAX_RETRY_DELAY_SECONDS = 60
 BASE64URL = re.compile(r"^[A-Za-z0-9_-]{43}$")
+CONTENT_KEY_BYTES = 32
+CONTENT_KEY_TEMP_MAX_AGE_SECONDS = 60 * 60
 VERIFICATION_CODE = re.compile(r"^[0-9]{8}$")
 PAIR_ID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-"
@@ -50,20 +53,102 @@ class SetupError(Exception):
 
 def random_secret():
     """32 random bytes as unpadded base64url (43 characters)."""
-    import base64
-
     return base64.urlsafe_b64encode(os.urandom(32)).rstrip(b"=").decode("ascii")
 
 
+def content_key_path(directory):
+    return os.path.join(directory, "content-key")
+
+
+def content_key_encode(key):
+    return base64.urlsafe_b64encode(key).rstrip(b"=").decode("ascii")
+
+
+def _write_temp_key(directory, key):
+    """A complete 0600 key file that no reader can see under its final name yet."""
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".content-key.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(key)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return tmp
+
+
+def _remove_stale_temp_keys(directory):
+    """A crash between the fsync and the link leaves a temp file; drop old ones."""
+    now = time.time()
+    for name in os.listdir(directory):
+        if not (name.startswith(".content-key.") and name.endswith(".tmp")):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            if now - os.path.getmtime(path) > CONTENT_KEY_TEMP_MAX_AGE_SECONDS:
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+def load_or_create_content_key(directory):
+    """The Mac's content key, created on first use. Raises OSError if it cannot be written.
+
+    If two processes repair a corrupt (not 32-byte) file at the same time, one may return
+    a key that the other has since replaced. New keys are published with link and do not race.
+    """
+    path = content_key_path(directory)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    _remove_stale_temp_keys(directory)
+    while True:
+        try:
+            with open(path, "rb") as handle:
+                existing = handle.read()
+        except FileNotFoundError:
+            existing = None
+        if existing is not None and len(existing) == CONTENT_KEY_BYTES:
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
+            return existing
+        key = os.urandom(CONTENT_KEY_BYTES)
+        tmp = _write_temp_key(directory, key)
+        try:
+            if existing is None:
+                try:
+                    # 完成した一時ファイルだけを公開する。負けた側は公開された鍵を読み直す。
+                    os.link(tmp, path)
+                    return key
+                except FileExistsError:
+                    continue
+            # 32 バイトでない既存ファイルは壊れている。書きかけは link 前なので見えない。
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+            return key
+        finally:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
+
 def parse_pair_string(text):
-    """Split `<pair_id>.<claim_secret>` into its two parts."""
-    pair_id, separator, claim_secret = text.strip().partition(".")
-    if not separator:
-        raise ValueError("pairing string has no '.' separator")
-    pair_id = parse_pair_id(pair_id)
-    if not BASE64URL.match(claim_secret):
+    """Split `<pair_id>.<claim_secret>[.<content_key>]`; the third part is optional."""
+    parts = text.strip().split(".")
+    if len(parts) not in (2, 3):
+        raise ValueError("pairing string must have 2 or 3 parts")
+    pair_id = parse_pair_id(parts[0])
+    if not BASE64URL.match(parts[1]):
         raise ValueError("claim_secret is not 43 base64url characters")
-    return pair_id, claim_secret
+    if len(parts) == 3 and not BASE64URL.match(parts[2]):
+        raise ValueError("content_key is not 43 base64url characters")
+    return pair_id, parts[1]
 
 
 def parse_pair_id(text):
@@ -552,6 +637,7 @@ def run_pairing(client, config, config_path, host, workspace_allowlist=None, ser
         else:
             print("POST /v1/pairings returned %s" % status)
         return 1
+    # 0.2.0 までのアプリは2つ目以降を claim secret として送るので、3つ目を足さない。
     pair_string = "%s.%s" % (pair_id, claim_secret)
     print("Pairing code (valid for 5 minutes): %s" % pair_string)
     if copy_to_clipboard(pair_string):
@@ -706,7 +792,9 @@ def pair_bootstrap(client, config, config_path, socket, service_info):
         raise PairFailure("relay_error") from exc
 
 
-def approve_pairing(client, config, config_path, host, pair_id, code, relay_code, emit):
+def approve_pairing(
+    client, config, config_path, host, pair_id, code, relay_code, content_key, emit
+):
     path = "/v1/pairings/%s" % pair_id
     if not hmac.compare_digest(code, relay_code):
         raise PairFailure("code_mismatch")
@@ -723,11 +811,18 @@ def approve_pairing(client, config, config_path, host, pair_id, code, relay_code
         raise PairFailure("relay_error" if outcome == "failed" else outcome)
     host["host_id"] = payload.get("host_id") or host.get("host_id")
     save_config(config_path, config)
-    emit({"result": "approved", "link_id": payload.get("link_id"), "host_id": host["host_id"]})
+    emit(
+        {
+            "result": "approved",
+            "link_id": payload.get("link_id"),
+            "host_id": host["host_id"],
+            "content_key": content_key_encode(content_key),
+        }
+    )
     return 0
 
 
-def await_claim(client, config, config_path, host, pair_id, inbox, emit):
+def await_claim(client, config, config_path, host, pair_id, inbox, content_key, emit):
     path = "/v1/pairings/%s" % pair_id
     deadline = time.monotonic() + PAIRING_LIFETIME_SECONDS
     code = None
@@ -751,7 +846,8 @@ def await_claim(client, config, config_path, host, pair_id, inbox, emit):
             if not isinstance(relay_code, str) or not VERIFICATION_CODE.fullmatch(relay_code):
                 raise PairFailure("relay_error")
             return approve_pairing(
-                client, config, config_path, host, pair_id, code, relay_code, emit
+                client, config, config_path, host, pair_id, code, relay_code,
+                content_key, emit,
             )
         wait = max(0, min(POLL_INTERVAL_SECONDS, deadline - time.monotonic()))
         if code is not None:
@@ -778,6 +874,10 @@ def cmd_pair(relay_url, stdin, emit):
     directory = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or default_config_dir()
     if not os.path.isabs(directory):
         raise PairFailure("config_error")
+    try:
+        content_key = load_or_create_content_key(directory)
+    except OSError as exc:
+        raise PairFailure("config_error") from exc
     config_path = os.path.join(directory, "config.json")
     config = load_config(config_path)
     saved = config.get("relay_url")
@@ -818,7 +918,9 @@ def cmd_pair(relay_url, stdin, emit):
     inbox = queue.Queue()
     threading.Thread(target=read_code_line, args=(stdin, inbox), daemon=True).start()
     try:
-        return await_claim(client, config, config_path, host, pair_id, inbox, emit)
+        return await_claim(
+            client, config, config_path, host, pair_id, inbox, content_key, emit
+        )
     except BaseException as exc:
         if not (isinstance(exc, PairFailure) and exc.code in ("expired", "cancelled")):
             try:
@@ -843,6 +945,32 @@ def run_pair(relay_url, stdin=None, stdout=None):
             code = "internal"
     emit({"error": code})
     return 1
+
+
+def run_content_key(stdout=None):
+    """`content-key`: one JSON line with the Mac's key, created if missing."""
+    emit = make_emitter(stdout or sys.stdout)
+    try:
+        directory = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or default_config_dir()
+        if not os.path.isabs(directory) or not os.path.isdir(directory):
+            raise SetupError("config dir is missing")
+        key = load_or_create_content_key(directory)
+    except (OSError, SetupError):
+        emit({"error": "config_error"})
+        return 1
+    emit({"content_key": content_key_encode(key)})
+    return 0
+
+
+def remove_content_key_files(directory):
+    """The key and any temp file left by an interrupted creation."""
+    paths = [content_key_path(directory)]
+    paths += glob.glob(os.path.join(directory, ".content-key.*.tmp"))
+    for path in paths:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
 
 
 def remove_state_files(directory):
@@ -892,6 +1020,7 @@ def cmd_uninstall(client, config, config_path, state_directory=None):
         os.unlink(config_path)
     except FileNotFoundError:
         pass
+    remove_content_key_files(os.path.dirname(config_path))
     directory = state_directory or state_dir()
     remove_state_files(directory)
     # host ごとの state ディレクトリ（旧 spool/ もここに入る）。
@@ -947,9 +1076,12 @@ def main(argv=None):
     uninstall.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     pair = subparsers.add_parser("pair", help="non-interactive pairing for the Herdsight app")
     pair.add_argument("--relay-url", required=True)
+    subparsers.add_parser("content-key", help="print the content key for the Herdsight app")
     args = parser.parse_args(argv)
     if args.command == "pair":
         return run_pair(args.relay_url)
+    if args.command == "content-key":
+        return run_content_key()
 
     try:
         config_path = os.path.join(config_dir(), "config.json")
@@ -1008,6 +1140,13 @@ def main(argv=None):
             host = bootstrap_host(client, config, config_path, socket, service_info)
         config["relay_url"] = base_url
         save_config(config_path, config)
+        try:
+            # 手動の文字列には載せない。鍵は SSH の pair か content-key で渡す。
+            load_or_create_content_key(os.path.dirname(config_path))
+        except OSError as exc:
+            raise SetupError(
+                "cannot write the content key: %s" % type(exc).__name__
+            ) from exc
         return run_pairing(
             client,
             config,
