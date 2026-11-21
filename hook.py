@@ -26,7 +26,7 @@ from urllib import error, request
 from urllib.parse import urlparse
 
 PLUGIN_ID = "herdsight.notify"
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.3.1"
 EVENT_STATES = {"blocked", "idle", "working", "done", "unknown"}
 PENDING_MAX = 16
 HOOK_BUDGET_SECONDS = 45

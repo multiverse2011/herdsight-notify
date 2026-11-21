@@ -15,12 +15,23 @@ CODE = "12345678"
 HOST_ID = "22222222-2222-4222-8222-222222222222"
 
 
+SERVICE = {
+    "service_profile": "personal-self-use-v1",
+    "registrations_open": True,
+    "terms_version": "t",
+    "privacy_notice_version": "p",
+    "operator": {"name": "Relay Test"},
+    "terms_url": "https://relay.test/terms",
+    "privacy_notice_url": "https://relay.test/privacy",
+}
+
+
 class FakeRelay:
     """(method, path の先頭) ごとに応答を返す。リストは順に使い、最後の値を繰り返す。"""
 
     def __init__(self, **responses):
         self.responses = {
-            "service": [(200, {"terms_version": "t", "privacy_notice_version": "p"})],
+            "service": [(200, SERVICE)],
             "hosts": [(201, {"expires_at": "2027-01-01T00:00:00Z"})],
             "create": [(201, {"expires_at": "2026-11-14T00:05:00Z"})],
             "get": [(200, {"state": "pending"}), (200, {"state": "claimed", "verification_code": CODE})],
@@ -113,13 +124,13 @@ class PairTests(unittest.TestCase):
             "host_expires_at": "2027-01-01T00:00:00Z",
         }
 
-    def run_pair(self, relay, stdin_text=None, stdin=None, relay_url=RELAY, stdout=None):
+    def run_pair(self, relay, stdin_text=None, stdin=None, relay_url=RELAY, stdout=None, terms="t", privacy="p"):
         out = stdout or io.StringIO()
         stdin = stdin or io.StringIO(
             json.dumps({"verification_code": CODE}) + "\n" if stdin_text is None else stdin_text
         )
         with unittest.mock.patch("setup.RelayClient", return_value=relay):
-            result = setup.run_pair(relay_url, stdin=stdin, stdout=out)
+            result = setup.run_pair(relay_url, terms, privacy, stdin=stdin, stdout=out)
         lines = [json.loads(line) for line in out.getvalue().splitlines()] if stdout is None else []
         return result, lines
 
@@ -234,6 +245,45 @@ class PairTests(unittest.TestCase):
         result, lines = self.run_pair(relay)
         self.assertEqual((result, lines), (1, [{"v": 1, "error": "service_unavailable"}]))
         self.assertFalse(os.path.exists(self.config_path))
+
+    def test_cli_forwards_document_versions_without_a_profile_argument(self):
+        with unittest.mock.patch("setup.run_pair", return_value=0) as run:
+            self.assertEqual(setup.main([
+                "pair", "--relay-url", RELAY,
+                "--accepted-terms-version", "t",
+                "--received-privacy-notice-version", "p",
+            ]), 0)
+        run.assert_called_once_with(RELAY, "t", "p")
+
+    def test_stale_or_missing_versions_never_write_or_register(self):
+        for terms, privacy in (("old", "p"), ("t", "old"), (None, None)):
+            with self.subTest(terms=terms, privacy=privacy):
+                relay = FakeRelay()
+                result, lines = self.run_pair(relay, terms=terms, privacy=privacy)
+                self.assertEqual(result, 1)
+                self.assert_error(lines, "service_version_mismatch")
+                self.assertEqual(relay.keys(), ["service"])
+                self.assertFalse(os.path.exists(self.config_path))
+                self.assertFalse(os.path.exists(setup.content_key_path(os.path.dirname(self.config_path))))
+
+    def test_closed_or_unsupported_service_stops_before_registration(self):
+        for info in ({**SERVICE, "registrations_open": False}, {**SERVICE, "service_profile": "other"}):
+            relay = FakeRelay(service=[(200, info)])
+            result, lines = self.run_pair(relay)
+            self.assertEqual(result, 1)
+            self.assert_error(lines, "service_unavailable")
+            self.assertEqual(relay.keys(), ["service"])
+
+    def test_bootstrap_race_preserves_registration_error(self):
+        for status, code, expected in (
+            (409, "service_version_mismatch", "service_version_mismatch"),
+            (503, "unavailable", "service_unavailable"),
+        ):
+            relay = FakeRelay(hosts=[(status, {"error": {"code": code}})])
+            result, lines = self.run_pair(relay)
+            self.assertEqual(result, 1)
+            self.assert_error(lines, expected)
+            self.assertEqual(relay.keys(), ["service", "hosts"])
 
     def test_pairing_busy(self):
         self.write_config({"relay_url": RELAY, "hosts": [self.host()]})

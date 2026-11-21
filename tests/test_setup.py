@@ -453,7 +453,6 @@ class BootstrapTests(unittest.TestCase):
                 [
                     (204, None),
                     (503, {"error": {"code": "unavailable"}}),
-                    (500, {"error": {"code": "internal_error"}}),
                 ]
             )
             failed_client = setup.RelayClient("https://relay.test", opener=failed_opener)
@@ -469,15 +468,8 @@ class BootstrapTests(unittest.TestCase):
                 self.assertEqual(json.load(handle)["hosts"], [])
             self.assertEqual(
                 [call.get_method() for call in failed_opener.calls],
-                ["DELETE", "POST", "POST"],
+                ["DELETE", "POST"],
             )
-            post_keys = [
-                FakeOpener.headers(call)["idempotency-key"]
-                for call in failed_opener.calls
-                if call.get_method() == "POST"
-            ]
-            self.assertEqual(post_keys[0], post_keys[1])
-
             retry_opener = FakeOpener([(201, {"expires_at": "2027-01-01T00:00:00.000Z"})])
             retry_client = setup.RelayClient("https://relay.test", opener=retry_opener)
             setup.bootstrap_host(
@@ -798,7 +790,7 @@ class MainTests(unittest.TestCase):
 
     def test_setup_flow_bootstraps_pairs_and_saves_config(self):
         relay = FakeRelay()
-        result, output, client_class = self.run_main([], relay)
+        result, output, client_class = self.run_main([], relay, answers=("y", "y"))
         self.assertEqual(result, 0)
         self.assertEqual(
             relay.keys(), ["service", "hosts", "create", "get", "get", "approve"]
@@ -821,6 +813,15 @@ class MainTests(unittest.TestCase):
         self.assertEqual(config["hosts"][0]["socket_path"], self.socket)
         self.assertEqual(config["hosts"][0]["workspace_allowlist"], [])
         self.assertEqual(os.stat(self.config_path).st_mode & 0o777, 0o600)
+
+    def test_setup_declined_terms_preserves_local_state(self):
+        relay = FakeRelay()
+        result, output, _client = self.run_main([], relay, answers=("n",))
+        self.assertEqual(result, 1)
+        self.assertEqual(relay.keys(), ["service"])
+        self.assertIn("https://relay.test/terms", output)
+        self.assertIn("https://relay.test/privacy", output)
+        self.assertFalse(os.path.exists(self.config_path))
 
     def test_setup_refuses_another_relay_before_any_request(self):
         setup.save_config(self.config_path, {"relay_url": "https://saved.test", "hosts": [HOST]})

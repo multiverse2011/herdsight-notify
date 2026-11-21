@@ -40,6 +40,8 @@ MAX_RETRY_DELAY_SECONDS = 60
 BASE64URL = re.compile(r"^[A-Za-z0-9_-]{43}$")
 CONTENT_KEY_BYTES = 32
 CONTENT_KEY_TEMP_MAX_AGE_SECONDS = 60 * 60
+SERVICE_PROFILE = "personal-self-use-v1"
+DOCUMENT_VERSION = re.compile(r"[A-Za-z0-9.-]{1,64}")
 VERIFICATION_CODE = re.compile(r"^[0-9]{8}$")
 PAIR_ID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-"
@@ -48,7 +50,25 @@ PAIR_ID = re.compile(
 
 
 class SetupError(Exception):
-    pass
+    code = "relay_error"
+
+
+class RegistrationError(SetupError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def registration_info(client):
+    status, info = client.get("/v1/service-info")
+    if (status != 200 or not isinstance(info, dict)
+            or info.get("service_profile") != SERVICE_PROFILE
+            or info.get("registrations_open") is not True
+            or any(not isinstance(info.get(key), str) or not DOCUMENT_VERSION.fullmatch(info[key])
+                   for key in ("terms_version", "privacy_notice_version"))):
+        raise RegistrationError("service_unavailable", "The relay is unavailable for new registrations.")
+    return info
+
 
 
 def random_secret():
@@ -358,7 +378,8 @@ def retry_delay_seconds(payload):
 
 
 def request_with_retry(
-    client, method, path, body=None, host=None, idempotency_key=None, retry_until=None
+    client, method, path, body=None, host=None, idempotency_key=None, retry_until=None,
+    retry_unavailable=True,
 ):
     """Retry relay throttling with a stable key for writes and bounded jittered waits."""
     if method in ("POST", "PATCH") and not idempotency_key:
@@ -369,7 +390,7 @@ def request_with_retry(
         status, payload = client.request(
             method, path, body=body, host=host, idempotency_key=idempotency_key
         )
-        if status not in (429, 503):
+        if status != 429 and (status != 503 or not retry_unavailable):
             return status, payload
         remaining = retry_until - time.monotonic()
         if remaining <= 0:
@@ -455,13 +476,18 @@ def bootstrap_host(client, config, config_path, socket, service_info):
     body = {
         "id": host_id,
         "secret": secret,
-        "service_profile": service_info.get("service_profile") or "eu-personal-v1",
+        "service_profile": service_info.get("service_profile"),
         "terms_version": service_info.get("terms_version"),
         "privacy_notice_version": service_info.get("privacy_notice_version"),
     }
     status, payload = request_with_retry(
-        client, "POST", "/v1/hosts", body, idempotency_key=str(uuid.uuid4())
+        client, "POST", "/v1/hosts", body, idempotency_key=str(uuid.uuid4()),
+        retry_unavailable=False,
     )
+    if status == 409 and error_code(payload) == "service_version_mismatch":
+        raise RegistrationError("service_version_mismatch", "The relay documents changed. Review them and try again.")
+    if status == 503:
+        raise RegistrationError("service_unavailable", "The relay is unavailable for new registrations.")
     if status not in (200, 201):
         raise SetupError("POST /v1/hosts returned %s" % status)
     host = _host_entry(host_id, secret, socket, (payload or {}).get("expires_at"))
@@ -789,7 +815,7 @@ def pair_bootstrap(client, config, config_path, socket, service_info):
     try:
         return bootstrap_host(client, config, config_path, socket, service_info)
     except SetupError as exc:
-        raise PairFailure("relay_error") from exc
+        raise PairFailure(exc.code) from exc
 
 
 def approve_pairing(
@@ -862,7 +888,7 @@ def await_claim(client, config, config_path, host, pair_id, inbox, content_key, 
             raise PairFailure("bad_input")
 
 
-def cmd_pair(relay_url, stdin, emit):
+def cmd_pair(relay_url, accepted_terms_version, received_privacy_notice_version, stdin, emit):
     """アプリが SSH で動かす非対話のペアリング。コードは stdin で受け取り、機械で照合する。"""
     socket = os.environ.get("HERDR_SOCKET_PATH") or default_socket_path()
     if not os.path.isabs(socket) or not os.path.exists(socket):
@@ -874,10 +900,6 @@ def cmd_pair(relay_url, stdin, emit):
     directory = os.environ.get("HERDR_PLUGIN_CONFIG_DIR") or default_config_dir()
     if not os.path.isabs(directory):
         raise PairFailure("config_error")
-    try:
-        content_key = load_or_create_content_key(directory)
-    except OSError as exc:
-        raise PairFailure("config_error") from exc
     config_path = os.path.join(directory, "config.json")
     config = load_config(config_path)
     saved = config.get("relay_url")
@@ -886,9 +908,14 @@ def cmd_pair(relay_url, stdin, emit):
         raise PairFailure("relay_mismatch")
     dev_access = os.environ.get("HERDSIGHT_RELAY_DEV_ACCESS") or config.get("dev_access")
     client = RelayClient(relay_url, dev_access)
-    status, service_info = client.get("/v1/service-info")
-    if status != 200 or not isinstance(service_info, dict):
-        raise PairFailure("service_unavailable")
+    service_info = registration_info(client)
+    if (service_info["terms_version"] != accepted_terms_version
+            or service_info["privacy_notice_version"] != received_privacy_notice_version):
+        raise PairFailure("service_version_mismatch")
+    try:
+        content_key = load_or_create_content_key(directory)
+    except OSError as exc:
+        raise PairFailure("config_error") from exc
     if not saved:
         config["relay_url"] = relay_url
         save_config(config_path, config)
@@ -901,7 +928,7 @@ def cmd_pair(relay_url, stdin, emit):
             client, config, config_path, host, service_info
         )
     except SetupError as exc:
-        raise PairFailure("relay_error") from exc
+        raise PairFailure(exc.code) from exc
     if status == 401:
         raise PairFailure("host_rejected")
     if status == 409 and error_code(payload) == "capacity_exceeded":
@@ -930,14 +957,17 @@ def cmd_pair(relay_url, stdin, emit):
         raise
 
 
-def run_pair(relay_url, stdin=None, stdout=None):
+def run_pair(relay_url, accepted_terms_version=None, received_privacy_notice_version=None, *, stdin=None, stdout=None):
     """stdout には JSON 行だけを書き、stderr には何も書かない。"""
     emit = make_emitter(stdout or sys.stdout)
     with open(os.devnull, "w") as sink, contextlib.redirect_stdout(sink), \
             contextlib.redirect_stderr(sink):
         try:
-            return cmd_pair(relay_url, stdin or sys.stdin, emit)
+            return cmd_pair(relay_url, accepted_terms_version, received_privacy_notice_version,
+                            stdin or sys.stdin, emit)
         except PairFailure as exc:
+            code = exc.code
+        except RegistrationError as exc:
             code = exc.code
         except (SetupError, OSError):
             code = "config_error"
@@ -1076,10 +1106,12 @@ def main(argv=None):
     uninstall.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     pair = subparsers.add_parser("pair", help="non-interactive pairing for the Herdsight app")
     pair.add_argument("--relay-url", required=True)
+    pair.add_argument("--accepted-terms-version")
+    pair.add_argument("--received-privacy-notice-version")
     subparsers.add_parser("content-key", help="print the content key for the Herdsight app")
     args = parser.parse_args(argv)
     if args.command == "pair":
-        return run_pair(args.relay_url)
+        return run_pair(args.relay_url, args.accepted_terms_version, args.received_privacy_notice_version)
     if args.command == "content-key":
         return run_content_key()
 
@@ -1116,22 +1148,29 @@ def main(argv=None):
                 return cmd_approve(client, config, host, args.pair_id, args.code)
             return cmd_cancel(client, host, args.pair_id)
 
-        # setup
-        status, service_info = client.get("/v1/service-info")
-        if status != 200 or not isinstance(service_info, dict):
-            if status in (401, 403) and not dev_access:
-                print(
-                    "GET /v1/service-info returned %s; set --dev-access or "
-                    "HERDSIGHT_RELAY_DEV_ACCESS for a development relay."
-                    % status
-                )
-            elif status == 503:
-                print(
-                    "GET /v1/service-info returned 503; check the relay configuration "
-                    "and development access."
-                )
-            else:
-                print("GET /v1/service-info returned %s from %s" % (status, base_url))
+        # Setup can create a host, including when an existing credential is rejected.
+        service_info = registration_info(client)
+        operator = service_info.get("operator")
+        name = operator.get("name") if isinstance(operator, dict) else None
+        terms = service_info.get("terms_url")
+        privacy = service_info.get("privacy_notice_url")
+        if not isinstance(name, str) or not name.strip() or not name.isprintable():
+            raise SetupError("The relay did not provide a valid operator name.")
+        for url in (terms, privacy):
+            if not isinstance(url, str) or not url.isprintable() or any(ch.isspace() for ch in url):
+                raise SetupError("The relay did not provide valid document URLs.")
+            try:
+                parsed = urlparse(url)
+                valid = parsed.scheme == "https" and parsed.hostname and not parsed.username and not parsed.password
+            except ValueError:
+                valid = False
+            if not valid:
+                raise SetupError("The relay did not provide valid document URLs.")
+        print("Relay operator: %s" % name)
+        print("Terms (%s): %s" % (service_info["terms_version"], terms))
+        print("Privacy notice (%s): %s" % (service_info["privacy_notice_version"], privacy))
+        if not confirm("Accept these terms and acknowledge receipt of this privacy notice? [y/N]: "):
+            print("Relay setup cancelled.")
             return 1
         socket = socket_path(args.socket_path)
         print("Using herdr socket: %s" % socket)
