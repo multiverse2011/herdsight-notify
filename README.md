@@ -20,12 +20,19 @@ notifications.
 
 In the Herdsight app, open notification setup for a Mac whose host key you have approved and
 tap **Set Up Notifications**. The app connects over SSH and, if the plugin is missing or older
-than 0.2.0, asks before running `herdr plugin install` / `herdr plugin update` through your
+than 0.3.1, asks before running `herdr plugin install` / `herdr plugin update` through your
 login shell. It then runs:
 
 ```bash
-cd <plugin root> && /usr/bin/python3 setup.py pair --relay-url <relay URL>
+cd <plugin root> && /usr/bin/python3 setup.py pair --relay-url <relay URL> \
+  --accepted-terms-version <version> --received-privacy-notice-version <version>
 ```
+
+The app obtains both document versions from service-info and prompts before it runs setup.
+The Mac fetches service-info again and proceeds only when registration is open, the service
+profile is supported, and both versions match. A document change returns
+`service_version_mismatch`. Closed registration returns `service_unavailable`.
+Manual Mac setup displays the document URLs and asks for acceptance before creating a host.
 
 `pair` creates the pairing and the Mac's content key, prints the pairing as one JSON line,
 reads the 8-digit code the app got from the relay on stdin, compares it with the relay's
